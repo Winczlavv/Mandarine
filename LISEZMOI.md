@@ -1,19 +1,23 @@
 # 🍊 Mandarine
 
-Convertisseur de fichiers local pour Mac, façon Arazio / Tangerine.
+Convertisseur de fichiers local pour Mac (Apple Silicon et Intel, macOS 13+).
 
-## Installation
-1. Dézippe le dossier (par ex. dans Téléchargements).
-2. Ouvre Terminal et tape : `bash ~/Downloads/Mandarine/build.sh`
-3. Si macOS propose d'installer les outils de développement, accepte puis relance la commande.
+## Installation (utilisateurs)
+Dans le Terminal :
+```
+curl -fsSL https://raw.githubusercontent.com/Winczlavv/Mandarine/main/install.sh | bash
+```
 
 ## Utilisation
-Dans le Finder, commence à glisser un fichier puis maintiens :
-- **⇧ Maj** → roue de conversion (JPG, PNG, HEIC, PDF, MP4, M4A, DOCX…)
-- **⌥ Option** → roue d'outils (compresser, pivoter, OCR, QR code, fusionner/diviser PDF, GIF, muet, ZIP…)
+- Glisser un fichier + **⇧ Maj** → convertir · + **⌥ Option** → outils
+- Sélectionner un fichier + **⌃⌥M** → roue cliquable (clic au centre pour basculer Convertir ⇄ Outils)
+- **Clic droit → Services → Mandarine : Convertir… / Outils…**
 
-Relâche sur un format : le résultat apparaît à côté de l'original. Relâche au centre pour annuler.
-Plusieurs fichiers sélectionnés = traitement en lot.
+Le résultat apparaît à côté de l'original. Mandarine se met à jour toute seule.
 
-## Formats étendus (optionnel)
-`brew install ffmpeg` débloque MP3, FLAC, OGG, OPUS, WEBM, MKV, AVI, WEBP et la lecture de quasi tous les formats audio/vidéo. Relance l'app ensuite.
+## Développement
+- `./build.sh` compile pour ce Mac et installe dans /Applications.
+- Publier une version : `git tag v1.1 && git push origin v1.1`. GitHub Actions compile les versions Apple Silicon et Intel (ffmpeg inclus) et crée la release.
+
+## Licences
+ffmpeg est intégré sous forme de binaire statique (builds de Martin Riedl, licence GPL). Source : https://ffmpeg.org · script de build : https://git.martin-riedl.de/ffmpeg/build-script

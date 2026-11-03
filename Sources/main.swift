@@ -1,7 +1,8 @@
 // Mandarine — convertisseur de fichiers local pour macOS
 // ⇧ + glisser un fichier dans le Finder → roue de conversion
 // ⌥ + glisser un fichier                → roue d'outils
-// Tout est traité en local. ffmpeg (Homebrew) est optionnel et débloque MP3, WEBM, FLAC…
+// ⌃⌥M ou clic droit → Services → Mandarine  → roue cliquable
+// Tout est traité en local. ffmpeg est embarqué dans l'app publiée.
 
 import Cocoa
 import AVFoundation
@@ -11,6 +12,8 @@ import UniformTypeIdentifiers
 import ImageIO
 import CoreText
 import ServiceManagement
+import Carbon.HIToolbox
+import CoreImage
 
 // MARK: - Utilitaires
 
@@ -25,6 +28,19 @@ typealias Conv = (URL, URL) throws -> Void
 struct Item {
     let label: String
     let perform: ([URL]) throws -> String
+    var prompt: (() -> Bool)? = nil
+
+    init(label: String, perform: @escaping ([URL]) throws -> String) {
+        self.label = label
+        self.perform = perform
+    }
+
+    /// Pose une question (sur le fil principal) avant d'exécuter l'action. false = annulé.
+    func asking(_ p: @escaping () -> Bool) -> Item {
+        var c = self
+        c.prompt = p
+        return c
+    }
 }
 
 func norm(_ e: String) -> String {
@@ -94,8 +110,12 @@ func shell(_ exe: String, _ args: [String], cwd: URL? = nil) throws {
 }
 
 enum FF {
-    static let path: String? = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
-        .first { FileManager.default.isExecutableFile(atPath: $0) }
+    static let path: String? = {
+        var candidates: [String] = []
+        if let b = Bundle.main.path(forAuxiliaryExecutable: "ffmpeg") { candidates.append(b) }
+        candidates += ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }()
 
     static func run(_ s: URL, _ d: URL, _ args: [String]) throws {
         guard let path else { throw E("Nécessite ffmpeg : brew install ffmpeg") }
@@ -218,6 +238,44 @@ enum Img {
             doc.insert(page, at: doc.pageCount)
         }
         guard doc.write(to: d) else { throw E("Écriture PDF impossible") }
+    }
+
+    static func jpegData(_ img: CGImage, q: Double) -> Data? {
+        let data = NSMutableData()
+        guard let d = CGImageDestinationCreateWithData(data as CFMutableData, "public.jpeg" as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(d, img, [kCGImageDestinationLossyCompressionQuality: q] as CFDictionary)
+        guard CGImageDestinationFinalize(d) else { return nil }
+        return data as Data
+    }
+
+    /// JPEG le plus beau possible sous maxBytes (qualité puis dimensions).
+    static func fitJPEG(_ start: CGImage, maxBytes: Int) throws -> Data {
+        var img = flatten(start)
+        for _ in 0..<10 {
+            if let d = jpegData(img, q: 0.92), d.count <= maxBytes { return d }
+            var lo = 0.15, hi = 0.92
+            var best: Data?
+            for _ in 0..<6 {
+                let mid = (lo + hi) / 2
+                guard let d = jpegData(img, q: mid) else { break }
+                if d.count <= maxBytes { best = d; lo = mid } else { hi = mid }
+            }
+            if let best { return best }
+            img = flatten(resize(img, 0.75))
+        }
+        throw E("Impossible d'atteindre cette taille")
+    }
+
+    @available(macOS 14.0, *)
+    static func removeBackground(_ img: CGImage) throws -> CGImage {
+        let req = VNGenerateForegroundInstanceMaskRequest()
+        let handler = VNImageRequestHandler(cgImage: img, options: [:])
+        try handler.perform([req])
+        guard let obs = req.results?.first, !obs.allInstances.isEmpty else { throw E("Aucun sujet détecté") }
+        let buf = try obs.generateMaskedImage(ofInstances: obs.allInstances, from: handler, croppedToInstancesExtent: false)
+        let ci = CIImage(cvPixelBuffer: buf)
+        guard let out = CIContext().createCGImage(ci, from: ci.extent) else { throw E("Détourage impossible") }
+        return out
     }
 
     static func ocr(_ img: CGImage) throws -> String {
@@ -356,6 +414,44 @@ enum Pdf {
             let out = doc.pageCount == 1 ? d : uniq(dir, "\(base)-\(i + 1)", ext)
             try Img.write(img, out, uti: uti)
         }
+    }
+
+    /// PDF sous maxBytes : d'abord optimisation, sinon pages converties en images de plus en plus légères.
+    static func fit(_ u: URL, maxBytes: Int, suffix: String) throws -> (url: URL, raster: Bool) {
+        if fileSize(u) <= maxBytes { throw E("Déjà sous \(Target.label)") }
+        let d = outURL(u, ext: "pdf", suffix: suffix)
+        if #available(macOS 13.4, *) {
+            let doc = try open(u)
+            if doc.write(to: d, withOptions: [.saveImagesAsJPEGOption: true, .optimizeImagesForScreenOption: true]),
+               fileSize(d) <= maxBytes { return (d, false) }
+            try? FileManager.default.removeItem(at: d)
+        }
+        let doc = try open(u)
+        let steps: [(CGFloat, Double)] = [(2.0, 0.75), (1.6, 0.65), (1.3, 0.55), (1.0, 0.5), (0.8, 0.45), (0.6, 0.4), (0.45, 0.35)]
+        for (scale, q) in steps {
+            let data = NSMutableData()
+            guard let consumer = CGDataConsumer(data: data as CFMutableData),
+                  let ctx = CGContext(consumer: consumer, mediaBox: nil, nil) else { break }
+            for i in 0..<doc.pageCount {
+                guard let p = doc.page(at: i), let img = pageImage(p, scale: scale),
+                      let jd = Img.jpegData(Img.flatten(img), q: q),
+                      let prov = CGDataProvider(data: jd as CFData),
+                      let jimg = CGImage(jpegDataProviderSource: prov, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+                else { continue }
+                let b = p.bounds(for: .mediaBox)
+                let rot = p.rotation % 180 != 0
+                var box = CGRect(x: 0, y: 0, width: rot ? b.height : b.width, height: rot ? b.width : b.height)
+                ctx.beginPage(mediaBox: &box)
+                ctx.draw(jimg, in: box)
+                ctx.endPage()
+            }
+            ctx.closePDF()
+            if data.length <= maxBytes {
+                try (data as Data).write(to: d)
+                return (d, true)
+            }
+        }
+        throw E("Impossible d'atteindre \(Target.label)")
     }
 
     /// Texte du PDF, avec OCR automatique si le PDF est scanné.
@@ -567,18 +663,26 @@ enum Catalog {
     static func tools(_ k: Kind, _ urls: [URL]) -> [Item] {
         switch k {
         case .image:
-            return [
+            var list: [Item] = [
                 each("Compresser") { u in
                     let d = outURL(u, ext: "jpg", suffix: "-compressé")
                     try Img.write(try Img.load(u, maxPixel: 2560), d, uti: "public.jpeg", q: 0.6)
                     return d
                 },
-                each("Réduire\n50 %") { u in
-                    let f = Img.sameFormat(u)
-                    let d = outURL(u, ext: f.ext, suffix: "-50")
-                    try Img.write(Img.resize(try Img.load(u), 0.5), d, uti: f.uti)
+                each("Taille\ncible") { u in
+                    let d = outURL(u, ext: "jpg", suffix: "-" + Target.short)
+                    try Img.fitJPEG(try Img.load(u), maxBytes: Target.bytes).write(to: d)
                     return d
-                },
+                }.asking(Target.ask),
+            ]
+            if #available(macOS 14.0, *) {
+                list.append(each("Détourer") { u in
+                    let d = outURL(u, ext: "png", suffix: "-détouré")
+                    try Img.write(try Img.removeBackground(try Img.load(u)), d, uti: "public.png")
+                    return d
+                })
+            }
+            return list + [
                 each("Pivoter\n↻") { u in
                     let f = Img.sameFormat(u)
                     let d = outURL(u, ext: f.ext, suffix: "-pivoté")
@@ -663,6 +767,16 @@ enum Catalog {
                     if last.isEmpty { return "Déjà optimisé, rien à gagner" }
                     return "✓ \(last) (−\(ByteCountFormatter.string(fromByteCount: saved, countStyle: .file)))"
                 },
+                Item(label: "Taille\ncible") { urls in
+                    var last = ""
+                    var raster = false
+                    for u in urls {
+                        let r = try Pdf.fit(u, maxBytes: Target.bytes, suffix: "-" + Target.short)
+                        last = r.url.lastPathComponent
+                        raster = raster || r.raster
+                    }
+                    return "✓ \(last)" + (raster ? " (pages converties en images)" : "")
+                }.asking(Target.ask),
                 Item(label: "Diviser") { urls in
                     var n = 0
                     for u in urls {
@@ -788,6 +902,11 @@ enum Runner {
     static let queue = DispatchQueue(label: "mandarine.work", qos: .userInitiated)
 
     static func run(_ item: Item, _ urls: [URL]) {
+        DispatchQueue.main.async { start(item, urls) }
+    }
+
+    private static func start(_ item: Item, _ urls: [URL]) {
+        if let ask = item.prompt, !ask() { return }
         let p = NSEvent.mouseLocation
         Toast.show("⏳ \(item.label.replacingOccurrences(of: "\n", with: " "))…", near: p, sticky: true)
         queue.async {
@@ -807,6 +926,9 @@ final class RadialView: NSView {
     var items: [Item] = []
     var urls: [URL] = []
     var title = ""
+    var clickMode = false
+    var onClose: (() -> Void)?
+    var onCenterClick: (() -> Void)?
     let rIn: CGFloat = 52, rOut: CGFloat = 170
     var hi: Int? {
         didSet {
@@ -854,10 +976,36 @@ final class RadialView: NSView {
         return .copy
     }
 
+    // Mode clic (raccourci clavier / clic droit)
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach { removeTrackingArea($0) }
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseMoved, .activeAlways, .inVisibleRect], owner: self))
+    }
+    override var acceptsFirstResponder: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseMoved(with e: NSEvent) {
+        if clickMode { hi = index(at: convert(e.locationInWindow, from: nil)) }
+    }
+
+    override func mouseDown(with e: NSEvent) {
+        guard clickMode else { return }
+        let p = convert(e.locationInWindow, from: nil)
+        if hypot(p.x - c.x, p.y - c.y) <= rIn { onCenterClick?(); return }
+        let i = index(at: p)
+        onClose?()
+        if let i { Runner.run(items[i], urls) }
+    }
+
+    override func keyDown(with e: NSEvent) {
+        if e.keyCode == 53 { onClose?() } else { super.keyDown(with: e) }   // Échap
+    }
+
     override func performDragOperation(_ s: NSDraggingInfo) -> Bool {
         let i = index(at: convert(s.draggingLocation, from: nil))
         hi = nil
-        window?.orderOut(nil)
+        onClose?()
         if let i { Runner.run(items[i], urls) }   // relâché au centre = annuler
         return true
     }
@@ -905,7 +1053,9 @@ final class RadialView: NSView {
         if let u = urls.first {
             NSWorkspace.shared.icon(forFile: u.path).draw(in: NSRect(x: c.x - 18, y: c.y - 6, width: 36, height: 36))
         }
-        let t = NSAttributedString(string: urls.count > 1 ? "\(title) ×\(urls.count)" : title, attributes: [
+        var label = urls.count > 1 ? "\(title) ×\(urls.count)" : title
+        if clickMode { label += " ⇄" }
+        let t = NSAttributedString(string: label, attributes: [
             .font: NSFont.systemFont(ofSize: 10, weight: .medium),
             .foregroundColor: NSColor(calibratedWhite: 1, alpha: 0.6),
             .paragraphStyle: para,
@@ -914,44 +1064,86 @@ final class RadialView: NSView {
     }
 }
 
+final class KeyPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
+
 final class RadialPanel {
     let view = RadialView(frame: NSRect(x: 0, y: 0, width: 360, height: 360))
-    let panel: NSPanel
+    let panel: KeyPanel
     private var gen = 0
+    private var monitor: Any?
+    private var urls: [URL] = []
+    private var fileKind: Kind = .other
+    private var tools = false
 
     init() {
-        panel = NSPanel(contentRect: view.frame, styleMask: [.borderless, .nonactivatingPanel],
-                        backing: .buffered, defer: false)
+        panel = KeyPanel(contentRect: view.frame, styleMask: [.borderless, .nonactivatingPanel],
+                         backing: .buffered, defer: false)
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = false
         panel.level = .popUpMenu
         panel.hidesOnDeactivate = false
+        panel.acceptsMouseMovedEvents = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.contentView = view
+        view.onClose = { [weak self] in self?.close() }
+        view.onCenterClick = { [weak self] in self?.toggle() }
     }
 
-    func show(at p: NSPoint, urls: [URL], tools: Bool) {
-        let k = kind(of: urls[0])
-        let same = urls.filter { kind(of: $0) == k }
-        var items = tools ? Catalog.tools(k, same) : Catalog.conversions(k, same)
-        if items.isEmpty { items = [Catalog.zipItem] }
-        view.configure(items: items, urls: same, title: tools ? "Outils" : "Convertir")
+    func show(at p: NSPoint, urls all: [URL], tools: Bool, click: Bool) {
+        close()
+        fileKind = kind(of: all[0])
+        urls = all.filter { kind(of: $0) == fileKind }
+        self.tools = tools
+        view.clickMode = click
+        reload()
         gen += 1
-        panel.setFrameOrigin(NSPoint(x: p.x - 180, y: p.y - 180))
+
+        var origin = NSPoint(x: p.x - 180, y: p.y - 180)
+        if let scr = NSScreen.screens.first(where: { NSMouseInRect(p, $0.frame, false) }) {
+            let f = scr.visibleFrame
+            origin.x = min(max(origin.x, f.minX), f.maxX - 360)
+            origin.y = min(max(origin.y, f.minY), f.maxY - 360)
+        }
+        panel.setFrameOrigin(origin)
         panel.alphaValue = 0
         panel.orderFrontRegardless()
+        if click {
+            panel.makeKey()
+            panel.makeFirstResponder(view)
+            monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+                self?.close()
+            }
+        }
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.12
             self.panel.animator().alphaValue = 1
         }
     }
 
+    private func reload() {
+        var items = tools ? Catalog.tools(fileKind, urls) : Catalog.conversions(fileKind, urls)
+        if items.isEmpty { items = [Catalog.zipItem] }
+        view.configure(items: items, urls: urls, title: tools ? "Outils" : "Convertir")
+    }
+
+    func toggle() {
+        tools.toggle()
+        reload()
+    }
+
+    func close() {
+        if let m = monitor { NSEvent.removeMonitor(m); monitor = nil }
+        panel.orderOut(nil)
+    }
+
     func hideLater() {
         let g = gen
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
             guard let self, self.gen == g else { return }
-            self.panel.orderOut(nil)
+            self.close()
         }
     }
 }
@@ -991,7 +1183,195 @@ final class DragWatcher {
         guard let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
               !urls.isEmpty else { return }
         shown = true
-        radial.show(at: NSEvent.mouseLocation, urls: urls, tools: tools)
+        radial.show(at: NSEvent.mouseLocation, urls: urls, tools: tools, click: false)
+    }
+}
+
+// MARK: - Taille cible
+
+enum Target {
+    static let choices: [(String, Int)] = [("500 Ko", 500_000), ("1 Mo", 1_000_000), ("2 Mo", 2_000_000),
+                                           ("5 Mo", 5_000_000), ("10 Mo", 10_000_000)]
+    static var bytes = 2_000_000
+    static var label: String { choices.first { $0.1 == bytes }?.0 ?? "" }
+    static var short: String { label.replacingOccurrences(of: " ", with: "") }
+
+    static func ask() -> Bool {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "Taille maximale ?"
+        a.informativeText = "Le fichier sera compressé juste ce qu'il faut pour passer sous cette taille."
+        let pop = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 180, height: 26), pullsDown: false)
+        pop.addItems(withTitles: choices.map { $0.0 })
+        let saved = UserDefaults.standard.object(forKey: "targetIndex") as? Int ?? 2
+        pop.selectItem(at: min(max(saved, 0), choices.count - 1))
+        a.accessoryView = pop
+        a.addButton(withTitle: "Compresser")
+        a.addButton(withTitle: "Annuler")
+        guard a.runModal() == .alertFirstButtonReturn else { return false }
+        let i = pop.indexOfSelectedItem
+        UserDefaults.standard.set(i, forKey: "targetIndex")
+        bytes = choices[i].1
+        return true
+    }
+}
+
+// MARK: - Raccourci clavier global (⌃⌥M) + sélection du Finder
+
+enum HotKey {
+    static var action: (() -> Void)?
+    static var ref: EventHotKeyRef?
+
+    static func register(_ f: @escaping () -> Void) {
+        action = f
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+            DispatchQueue.main.async { HotKey.action?() }
+            return noErr
+        }, 1, &spec, nil, nil)
+        let id = EventHotKeyID(signature: OSType(0x4D4E_4452), id: 1)
+        RegisterEventHotKey(UInt32(kVK_ANSI_M), UInt32(controlKey | optionKey), id, GetApplicationEventTarget(), 0, &ref)
+    }
+}
+
+enum Finder {
+    static func selection() -> [URL] {
+        let src = """
+        tell application "Finder"
+            set out to ""
+            repeat with i in (get selection)
+                set out to out & POSIX path of (i as alias) & linefeed
+            end repeat
+            return out
+        end tell
+        """
+        var err: NSDictionary?
+        guard let res = NSAppleScript(source: src)?.executeAndReturnError(&err).stringValue else { return [] }
+        return res.split(separator: "\n").map { URL(fileURLWithPath: String($0)) }
+    }
+}
+
+// MARK: - Clic droit (Services)
+
+final class ServiceProvider: NSObject {
+    var open: (([URL], Bool) -> Void)?
+
+    @objc func serviceConvert(_ pb: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>) {
+        handle(pb, tools: false)
+    }
+
+    @objc func serviceTools(_ pb: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>) {
+        handle(pb, tools: true)
+    }
+
+    private func handle(_ pb: NSPasteboard, tools: Bool) {
+        let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        guard !urls.isEmpty else { return }
+        open?(urls, tools)
+    }
+}
+
+// MARK: - Mises à jour automatiques (GitHub Releases)
+
+enum Updater {
+    static let repo = "Winczlavv/Mandarine"
+    static var current: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0" }
+    static var assetName: String {
+        #if arch(arm64)
+        return "Mandarine-arm64.zip"
+        #else
+        return "Mandarine-x86_64.zip"
+        #endif
+    }
+
+    static func newer(_ a: String, than b: String) -> Bool {
+        let x = a.split(separator: ".").map { Int($0) ?? 0 }
+        let y = b.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(x.count, y.count) {
+            let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0
+            if p != q { return p > q }
+        }
+        return false
+    }
+
+    static func info(_ text: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = text
+        a.runModal()
+    }
+
+    static func check(manual: Bool) {
+        var req = URLRequest(url: URL(string: "https://api.github.com/repos/\(repo)/releases/latest")!)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            guard let data,
+                  let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let tag = json["tag_name"] as? String else {
+                if manual { DispatchQueue.main.async { info("Impossible de vérifier les mises à jour pour le moment.") } }
+                return
+            }
+            let v = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+            let assets = json["assets"] as? [[String: Any]] ?? []
+            let link = assets.first { ($0["name"] as? String) == assetName }?["browser_download_url"] as? String
+            DispatchQueue.main.async {
+                guard newer(v, than: current), let link, let url = URL(string: link) else {
+                    if manual { info("Tu as déjà la dernière version (\(current)).") }
+                    return
+                }
+                if !manual && UserDefaults.standard.string(forKey: "skipVersion") == v { return }
+                propose(v, url)
+            }
+        }.resume()
+    }
+
+    static func propose(_ v: String, _ url: URL) {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "🍊 Mandarine \(v) est disponible"
+        a.informativeText = "Tu as la version \(current). La mise à jour prend quelques secondes."
+        a.addButton(withTitle: "Mettre à jour")
+        a.addButton(withTitle: "Plus tard")
+        guard a.runModal() == .alertFirstButtonReturn else {
+            UserDefaults.standard.set(v, forKey: "skipVersion")
+            return
+        }
+        Toast.show("⏳ Téléchargement de la mise à jour…", near: NSEvent.mouseLocation, sticky: true)
+        let zip = FileManager.default.temporaryDirectory.appendingPathComponent("Mandarine-update.zip")
+        URLSession.shared.downloadTask(with: url) { tmp, _, err in
+            do {
+                guard let tmp else { throw err ?? (E("Téléchargement impossible") as Error) }
+                try? FileManager.default.removeItem(at: zip)
+                try FileManager.default.moveItem(at: tmp, to: zip)
+                DispatchQueue.main.async { install(zip) }
+            } catch {
+                DispatchQueue.main.async { Toast.show("⚠︎ Mise à jour impossible", near: NSEvent.mouseLocation) }
+            }
+        }.resume()
+    }
+
+    /// Un petit script attend la fermeture de l'app, remplace le bundle puis relance.
+    static func install(_ zip: URL) {
+        let app = Bundle.main.bundlePath
+        let parent = (app as NSString).deletingLastPathComponent
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let script = """
+        while kill -0 \(pid) 2>/dev/null; do sleep 0.2; done
+        rm -rf '\(app)'
+        ditto -x -k '\(zip.path)' '\(parent)'
+        xattr -cr '\(app)' 2>/dev/null
+        /System/Library/CoreServices/pbs -update 2>/dev/null
+        open '\(app)'
+        """
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = ["-c", script]
+        do {
+            try p.run()
+            NSApp.terminate(nil)
+        } catch {
+            Toast.show("⚠︎ Mise à jour impossible", near: NSEvent.mouseLocation)
+        }
     }
 }
 
@@ -1000,7 +1380,9 @@ final class DragWatcher {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     let watcher = DragWatcher()
+    let services = ServiceProvider()
     var loginItem: NSMenuItem!
+    var updateTimer: Timer?
 
     func applicationDidFinishLaunching(_ n: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -1008,12 +1390,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
         watcher.start()
 
+        services.open = { [weak self] urls, tools in self?.openWheel(urls, tools: tools) }
+        NSApp.servicesProvider = services
+        NSUpdateDynamicServices()
+
+        HotKey.register { [weak self] in self?.hotKeyPressed() }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { Updater.check(manual: false) }
+        updateTimer = Timer.scheduledTimer(withTimeInterval: 86_400, repeats: true) { _ in Updater.check(manual: false) }
+
         if !UserDefaults.standard.bool(forKey: "welcomed") {
             UserDefaults.standard.set(true, forKey: "welcomed")
             NSApp.activate(ignoringOtherApps: true)
             let a = NSAlert()
             a.messageText = "🍊 Mandarine est prête"
-            a.informativeText = "Dans le Finder, commence à glisser un fichier puis maintiens :\n\n⇧ Maj → roue de conversion\n⌥ Option → roue d'outils\n\nRelâche sur un format. Le résultat apparaît à côté de l'original. Relâche au centre pour annuler."
+            a.informativeText = """
+            Trois façons de l'utiliser :
+
+            • Glisse un fichier et maintiens ⇧ Maj (convertir) ou ⌥ Option (outils).
+            • Sélectionne un fichier et appuie sur ⌃ Ctrl + ⌥ Option + M.
+            • Clic droit sur un fichier → Services → Mandarine.
+
+            Le résultat apparaît à côté de l'original.
+            """
             a.addButton(withTitle: "Lancer au démarrage")
             a.addButton(withTitle: "Plus tard")
             if a.runModal() == .alertFirstButtonReturn { try? SMAppService.mainApp.register() }
@@ -1021,24 +1420,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func openWheel(_ urls: [URL], tools: Bool) {
+        watcher.radial.show(at: NSEvent.mouseLocation, urls: urls, tools: tools, click: true)
+    }
+
+    func hotKeyPressed() {
+        let urls = Finder.selection()
+        guard !urls.isEmpty else {
+            Toast.show("Sélectionne d'abord un fichier dans le Finder", near: NSEvent.mouseLocation)
+            return
+        }
+        openWheel(urls, tools: false)
+    }
+
     func buildMenu() {
         let m = NSMenu()
-        m.addItem(withTitle: "Mandarine est active", action: nil, keyEquivalent: "")
+        m.addItem(withTitle: "Mandarine \(Updater.current)", action: nil, keyEquivalent: "")
         m.addItem(.separator())
         m.addItem(withTitle: "⇧ + glisser un fichier → Convertir", action: nil, keyEquivalent: "")
         m.addItem(withTitle: "⌥ + glisser un fichier → Outils", action: nil, keyEquivalent: "")
+        m.addItem(withTitle: "⌃⌥M sur un fichier sélectionné → Roue", action: nil, keyEquivalent: "")
+        m.addItem(withTitle: "Clic droit → Services → Mandarine", action: nil, keyEquivalent: "")
         m.addItem(.separator())
-        m.addItem(withTitle: FF.path != nil ? "ffmpeg détecté ✓ (formats étendus)"
-                                            : "ffmpeg absent : brew install ffmpeg pour MP3, WEBM, FLAC…",
-                  action: nil, keyEquivalent: "")
+        let upd = NSMenuItem(title: "Rechercher des mises à jour…", action: #selector(checkUpdates), keyEquivalent: "")
+        upd.target = self
+        m.addItem(upd)
         loginItem = NSMenuItem(title: "Lancer au démarrage", action: #selector(toggleLogin), keyEquivalent: "")
         loginItem.target = self
         m.addItem(loginItem)
+        if FF.path == nil {
+            m.addItem(withTitle: "ffmpeg absent : formats MP3, WEBM… indisponibles", action: nil, keyEquivalent: "")
+        }
         m.addItem(.separator())
         m.addItem(withTitle: "Quitter Mandarine", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         statusItem.menu = m
         refreshLogin()
     }
+
+    @objc func checkUpdates() { Updater.check(manual: true) }
 
     func refreshLogin() {
         loginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off

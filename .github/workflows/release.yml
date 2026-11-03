@@ -1,0 +1,25 @@
+name: Release
+
+# Pour publier : git tag v1.1 && git push origin v1.1
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compiler (Apple Silicon + Intel, ffmpeg inclus)
+        run: VERSION="${GITHUB_REF_NAME#v}" ./build.sh --release
+
+      - name: Publier la release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.zip \
+            --title "Mandarine $GITHUB_REF_NAME" --generate-notes

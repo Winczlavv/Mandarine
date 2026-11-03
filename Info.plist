@@ -13,5 +13,24 @@
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Mandarine lit les fichiers sélectionnés dans le Finder quand tu utilises le raccourci ⌃⌥M.</string>
+  <key>NSServices</key>
+  <array>
+    <dict>
+      <key>NSMenuItem</key><dict><key>default</key><string>Mandarine : Convertir…</string></dict>
+      <key>NSMessage</key><string>serviceConvert</string>
+      <key>NSPortName</key><string>Mandarine</string>
+      <key>NSRequiredContext</key><dict/>
+      <key>NSSendFileTypes</key><array><string>public.item</string></array>
+    </dict>
+    <dict>
+      <key>NSMenuItem</key><dict><key>default</key><string>Mandarine : Outils…</string></dict>
+      <key>NSMessage</key><string>serviceTools</string>
+      <key>NSPortName</key><string>Mandarine</string>
+      <key>NSRequiredContext</key><dict/>
+      <key>NSSendFileTypes</key><array><string>public.item</string></array>
+    </dict>
+  </array>
 </dict>
 </plist>
