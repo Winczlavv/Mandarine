@@ -125,7 +125,7 @@ enum FF {
 
 // MARK: - Type de fichier
 
-enum Kind { case image, video, audio, pdf, text, archive, folder, other }
+enum Kind { case image, video, audio, pdf, text, archive, folder, other, mixed }   // mixed = PDF + images
 
 let textExts: Set<String> = ["txt", "md", "rtf", "rtfd", "html", "docx", "doc", "odt"]
 let videoExts: Set<String> = ["mkv", "webm", "avi", "flv", "wmv", "mts", "m2ts", "3gp", "mpg", "mpeg"]
@@ -226,18 +226,6 @@ enum Img {
         c.rotate(by: -.pi / 2)
         c.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
         return c.makeImage() ?? img
-    }
-
-    static func toPDF(_ urls: [URL], _ d: URL) throws {
-        let doc = PDFDocument()
-        for u in urls {
-            let cg = try load(u)
-            let k = min(1, 842 / CGFloat(max(cg.width, cg.height)))
-            let ns = NSImage(cgImage: cg, size: NSSize(width: CGFloat(cg.width) * k, height: CGFloat(cg.height) * k))
-            guard let page = PDFPage(image: ns) else { throw E("Création PDF impossible") }
-            doc.insert(page, at: doc.pageCount)
-        }
-        guard doc.write(to: d) else { throw E("Écriture PDF impossible") }
     }
 
     static func jpegData(_ img: CGImage, q: Double) -> Data? {
@@ -467,6 +455,87 @@ enum Pdf {
     }
 }
 
+// MARK: - Fusion en PDF (PDF + images, dans l'ordre du Finder)
+
+enum Merge {
+    static let a4 = CGSize(width: 595, height: 842)
+
+    /// Écrit un PDF unique. Retourne le nombre de pages.
+    @discardableResult
+    static func write(_ urls: [URL], to d: URL) throws -> Int {
+        guard let ctx = CGContext(d as CFURL, mediaBox: nil, nil) else { throw E("Fusion impossible") }
+        var pages = 0
+        do {
+            for u in urls {
+                switch kind(of: u) {
+                case .pdf: pages += try addPDF(u, ctx)
+                case .image: try addImage(u, ctx); pages += 1
+                default: continue
+                }
+            }
+        } catch {
+            ctx.closePDF()
+            try? FileManager.default.removeItem(at: d)
+            throw error
+        }
+        ctx.closePDF()
+        guard pages > 0 else {
+            try? FileManager.default.removeItem(at: d)
+            throw E("Rien à fusionner")
+        }
+        return pages
+    }
+
+    /// Pages vectorielles : texte sélectionnable, formulaires remplis et annotations conservés.
+    static func addPDF(_ u: URL, _ ctx: CGContext) throws -> Int {
+        guard let doc = PDFDocument(url: u) else { throw E("PDF illisible : \(u.lastPathComponent)") }
+        if doc.isLocked { throw E("PDF protégé : \(u.lastPathComponent)") }
+        for i in 0..<doc.pageCount {
+            guard let p = doc.page(at: i) else { continue }
+            let b = p.bounds(for: .cropBox)
+            let rot = p.rotation % 180 != 0
+            var box = CGRect(x: 0, y: 0, width: rot ? b.height : b.width, height: rot ? b.width : b.height)
+            ctx.beginPage(mediaBox: &box)
+            ctx.saveGState()
+            p.transform(ctx, for: .cropBox)
+            p.draw(with: .cropBox, to: ctx)
+            ctx.restoreGState()
+            ctx.endPage()
+        }
+        return doc.pageCount
+    }
+
+    /// Image centrée sur une page A4 (portrait ou paysage selon la photo), compressée en JPEG.
+    static func addImage(_ u: URL, _ ctx: CGContext) throws {
+        let img = try Img.load(u, maxPixel: 2400)
+        let landscape = img.width > img.height
+        var box = CGRect(origin: .zero, size: landscape ? CGSize(width: a4.height, height: a4.width) : a4)
+        let area = box.insetBy(dx: 18, dy: 18)
+        let k = min(area.width / CGFloat(img.width), area.height / CGFloat(img.height))
+        let w = CGFloat(img.width) * k, h = CGFloat(img.height) * k
+        let rect = CGRect(x: box.midX - w / 2, y: box.midY - h / 2, width: w, height: h)
+
+        var drawn = img
+        if let jd = Img.jpegData(Img.flatten(img), q: 0.85),
+           let prov = CGDataProvider(data: jd as CFData),
+           let j = CGImage(jpegDataProviderSource: prov, decode: nil, shouldInterpolate: true, intent: .defaultIntent) {
+            drawn = j
+        }
+        ctx.beginPage(mediaBox: &box)
+        ctx.interpolationQuality = .high
+        ctx.draw(drawn, in: rect)
+        ctx.endPage()
+    }
+
+    static func item(_ label: String) -> Item {
+        Item(label: label) { urls in
+            let d = outURL(urls[0], ext: "pdf", suffix: urls.count > 1 ? "-fusionné" : "")
+            let n = try write(urls, to: d)
+            return "✓ \(d.lastPathComponent) (\(n) page\(n > 1 ? "s" : ""))"
+        }
+    }
+}
+
 // MARK: - Documents texte
 
 enum Txt {
@@ -616,7 +685,7 @@ enum Catalog {
                 if Img.writable.contains(uti) { nat = { s, d in try Img.convert(s, d, uti: uti) } }
                 list.append(conv(label, ext, nat, ext == "webp" ? FFA.webp : nil))
             }
-            list.append(conv("PDF", "pdf", { s, d in try Img.toPDF([s], d) }, nil))
+            list.append(conv("PDF", "pdf", { s, d in _ = try Merge.write([s], to: d) }, nil))
 
         case .video:
             let fmts: [(String, String, Conv?, [String]?)] = [
@@ -653,6 +722,9 @@ enum Catalog {
                 for u in urls { last = try Arc.unzip(u).lastPathComponent }
                 return "✓ \(last)"
             })
+
+        case .mixed:
+            list.append(Merge.item("PDF\nunique"))
 
         case .folder, .other:
             list.append(zipItem)
@@ -704,12 +776,7 @@ enum Catalog {
                     copyToClipboard(codes.joined(separator: "\n"))
                     return "✓ Copié : \(first)"
                 },
-                Item(label: "PDF\nunique") { urls in
-                    let s = byName(urls)
-                    let d = outURL(s[0], ext: "pdf")
-                    try Img.toPDF(s, d)
-                    return "✓ \(d.lastPathComponent)"
-                },
+                Merge.item("PDF\nunique"),
                 zipItem,
             ]
 
@@ -791,19 +858,7 @@ enum Catalog {
                     }
                     return "✓ \(n) pages extraites"
                 },
-                Item(label: "Fusionner") { urls in
-                    let s = byName(urls)
-                    let out = PDFDocument()
-                    for u in s {
-                        let doc = try Pdf.open(u)
-                        for i in 0..<doc.pageCount {
-                            if let p = doc.page(at: i)?.copy() as? PDFPage { out.insert(p, at: out.pageCount) }
-                        }
-                    }
-                    let d = uniq(s[0].deletingLastPathComponent(), "Fusion", "pdf")
-                    guard out.write(to: d) else { throw E("Fusion impossible") }
-                    return "✓ \(d.lastPathComponent) (\(out.pageCount) pages)"
-                },
+                Merge.item("Fusionner"),
                 each("Pivoter\n↻") { u in
                     let doc = try Pdf.open(u)
                     for i in 0..<doc.pageCount {
@@ -832,6 +887,9 @@ enum Catalog {
                 },
                 zipItem,
             ]
+
+        case .mixed:
+            return [Merge.item("Fusionner\nen PDF"), zipItem]
 
         case .audio, .archive, .folder, .other:
             return [zipItem]
@@ -1094,8 +1152,14 @@ final class RadialPanel {
 
     func show(at p: NSPoint, urls all: [URL], tools: Bool, click: Bool) {
         close()
-        fileKind = kind(of: all[0])
-        urls = all.filter { kind(of: $0) == fileKind }
+        let kinds = Set(all.map { kind(of: $0) })
+        if kinds.count > 1 && kinds.isSubset(of: [.pdf, .image]) {
+            fileKind = .mixed
+            urls = all.filter { [.pdf, .image].contains(kind(of: $0)) }
+        } else {
+            fileKind = kind(of: all[0])
+            urls = all.filter { kind(of: $0) == fileKind }
+        }
         self.tools = tools
         view.clickMode = click
         reload()
