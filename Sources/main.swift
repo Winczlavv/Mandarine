@@ -591,6 +591,83 @@ enum Txt {
     }
 }
 
+// MARK: - Conversion fidèle Word → PDF (Word, LibreOffice ou Pages)
+
+enum Office {
+    static let layoutExts: Set<String> = ["docx", "doc", "odt", "rtf"]
+
+    static func app(_ id: String) -> URL? { NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) }
+
+    static let wordScript = """
+    on run argv
+        set src to item 1 of argv
+        set dst to item 2 of argv
+        set wasRunning to application "Microsoft Word" is running
+        tell application "Microsoft Word"
+            open (POSIX file src)
+            set theDoc to active document
+            save as theDoc file name ((POSIX file dst) as text) file format format PDF
+            close theDoc saving no
+        end tell
+        if not wasRunning then tell application "Microsoft Word" to quit
+    end run
+    """
+
+    static let pagesScript = """
+    on run argv
+        set wasRunning to application "Pages" is running
+        tell application "Pages"
+            set theDoc to open (POSIX file (item 1 of argv))
+            export theDoc to (POSIX file (item 2 of argv)) as PDF
+            close theDoc saving no
+        end tell
+        if not wasRunning then tell application "Pages" to quit
+    end run
+    """
+
+    /// Essaie Word, puis LibreOffice, puis Pages. Retourne true si l'un d'eux a produit le PDF.
+    static func toPDF(_ s: URL, _ d: URL) -> Bool {
+        let fm = FileManager.default
+        if app("com.microsoft.Word") != nil {
+            if (try? shell("/usr/bin/osascript", ["-e", wordScript, s.path, d.path])) != nil, fm.fileExists(atPath: d.path) { return true }
+            try? fm.removeItem(at: d)
+        }
+        if let lo = app("org.libreoffice.script") {
+            let tmp = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? fm.removeItem(at: tmp) }
+            if (try? fm.createDirectory(at: tmp, withIntermediateDirectories: true)) != nil,
+               (try? shell(lo.appendingPathComponent("Contents/MacOS/soffice").path,
+                           ["--headless", "--convert-to", "pdf", "--outdir", tmp.path, s.path])) != nil {
+                let out = tmp.appendingPathComponent(s.deletingPathExtension().lastPathComponent + ".pdf")
+                if (try? fm.moveItem(at: out, to: d)) != nil { return true }
+            }
+        }
+        if app("com.apple.iWork.Pages") != nil {
+            if (try? shell("/usr/bin/osascript", ["-e", pagesScript, s.path, d.path])) != nil, fm.fileExists(atPath: d.path) { return true }
+            try? fm.removeItem(at: d)
+        }
+        return false
+    }
+
+    static var pdfItem: Item {
+        Item(label: "PDF") { urls in
+            var last = ""
+            var simplified = false
+            for u in urls {
+                let d = outURL(u, ext: "pdf")
+                if !(layoutExts.contains(norm(u.pathExtension)) && toPDF(u, d)) {
+                    try? FileManager.default.removeItem(at: d)
+                    try Txt.write(try Txt.read(u), d)
+                    if layoutExts.contains(norm(u.pathExtension)) { simplified = true }
+                }
+                last = d.lastPathComponent
+            }
+            let msg = urls.count == 1 ? "✓ \(last)" : "✓ \(urls.count) fichiers convertis"
+            return simplified ? msg + " · mise en page simplifiée" : msg
+        }
+    }
+}
+
 // MARK: - Archives
 
 enum Arc {
@@ -713,6 +790,7 @@ enum Catalog {
         case .text:
             for (label, ext) in [("PDF", "pdf"), ("DOCX", "docx"), ("TXT", "txt"), ("RTF", "rtf"),
                                  ("HTML", "html"), ("ODT", "odt"), ("DOC", "doc")] where ext != src {
+                if ext == "pdf" { list.append(Office.pdfItem); continue }
                 list.append(conv(label, ext, { s, d in try Txt.write(try Txt.read(s), d) }, nil))
             }
 

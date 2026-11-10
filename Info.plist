@@ -14,7 +14,7 @@
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSAppleEventsUsageDescription</key>
-  <string>Mandarine lit les fichiers sélectionnés dans le Finder quand tu utilises le raccourci ⌃⌥M.</string>
+  <string>Mandarine utilise le Finder (raccourci ⌃⌥M) et Word ou Pages (conversion fidèle en PDF).</string>
   <key>NSServices</key>
   <array>
     <dict>
